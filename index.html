@@ -198,6 +198,7 @@ header.bar button{padding:6px 8px;color:var(--acc);font-weight:600}
   </header>
   <div id="resWrap"><img id="resImg" alt="Documento escaneado"></div>
   <div class="foot">
+    <div class="lbl" id="resInfo"></div>
     <div class="seg" id="filterSeg">
       <button data-f="enhance" class="on">Mejorado</button>
       <button data-f="gray">Grises</button>
@@ -381,7 +382,8 @@ function outputSize(q, ratio, maxSide, cx, cy){
       if (r>=1) H = W/r; else W = H*r;
     }
   }
-  const s = Math.min(1, maxSide/Math.max(W,H));
+  // Escala fija: el lado largo = longSide px (p. ej. 3508 px = 297 mm a 300 ppi)
+  const s = maxSide/Math.max(W,H);
   return {W:Math.max(8,Math.round(W*s)), H:Math.max(8,Math.round(H*s))};
 }
 // Corrige la perspectiva: devuelve RGBA W×H
@@ -394,11 +396,18 @@ function warpData(sd, sw, sh, q, W, H){
       const xx=x+0.5, den=m[6]*xx+m[7]*yy+1;
       let fx=(m[0]*xx+m[1]*yy+m[2])/den-0.5, fy=(m[3]*xx+m[4]*yy+m[5])/den-0.5;
       if (fx<0) fx=0; if (fy<0) fy=0; if (fx>sw-1.001) fx=sw-1.001; if (fy>sh-1.001) fy=sh-1.001;
-      const x0=fx|0, y0=fy|0, ax=fx-x0, ay=fy-y0;
-      const i00=(y0*sw+x0)*4, i10=i00+4, i01=i00+sw*4, i11=i01+4, o=(y*W+x)*4;
+      // Interpolación bicúbica (Catmull-Rom): más nitidez al ampliar
+      const x0=fx|0, y0=fy|0, ax=fx-x0, ay=fy-y0, o=(y*W+x)*4;
+      const wx0=((-0.5*ax+1)*ax-0.5)*ax, wx1=(1.5*ax-2.5)*ax*ax+1, wx2=((-1.5*ax+2)*ax+0.5)*ax, wx3=(0.5*ax-0.5)*ax*ax;
+      const wy0=((-0.5*ay+1)*ay-0.5)*ay, wy1=(1.5*ay-2.5)*ay*ay+1, wy2=((-1.5*ay+2)*ay+0.5)*ay, wy3=(0.5*ay-0.5)*ay*ay;
+      const xs0=(x0>0?x0-1:0)*4, xs1=x0*4, xs2=(x0+1)*4, xs3=(x0+2<sw?x0+2:sw-1)*4;
+      const r0=(y0>0?y0-1:0)*sw*4, r1=y0*sw*4, r2=(y0+1)*sw*4, r3=(y0+2<sh?y0+2:sh-1)*sw*4;
       for (let c=0;c<3;c++){
-        const top=sd[i00+c]+(sd[i10+c]-sd[i00+c])*ax, bot=sd[i01+c]+(sd[i11+c]-sd[i01+c])*ax;
-        out[o+c]=top+(bot-top)*ay;
+        const a0=sd[r0+xs0+c]*wx0+sd[r0+xs1+c]*wx1+sd[r0+xs2+c]*wx2+sd[r0+xs3+c]*wx3;
+        const a1=sd[r1+xs0+c]*wx0+sd[r1+xs1+c]*wx1+sd[r1+xs2+c]*wx2+sd[r1+xs3+c]*wx3;
+        const a2=sd[r2+xs0+c]*wx0+sd[r2+xs1+c]*wx1+sd[r2+xs2+c]*wx2+sd[r2+xs3+c]*wx3;
+        const a3=sd[r3+xs0+c]*wx0+sd[r3+xs1+c]*wx1+sd[r3+xs2+c]*wx2+sd[r3+xs3+c]*wx3;
+        out[o+c]=a0*wy0+a1*wy1+a2*wy2+a3*wy3;
       }
       out[o+3]=255;
     }
@@ -420,11 +429,26 @@ function paperBackground(g, w, h){
   const bl = boxBlur(mx, sw, sh, 6);
   return {bl, sw, sh, s};
 }
+// Enfoque (máscara de desenfoque 3×3 sobre la luminancia)
+function sharpen(out, w, h, amount){
+  const n=w*h, g=toGray(out,n);
+  for (let y=1;y<h-1;y++){
+    const r=y*w;
+    for (let x=1;x<w-1;x++){
+      const i=r+x;
+      const sum=g[i-w-1]+g[i-w]+g[i-w+1]+g[i-1]+g[i]+g[i+1]+g[i+w-1]+g[i+w]+g[i+w+1];
+      const d=(g[i]-sum/9)*amount, j=i*4;
+      out[j]+=d; out[j+1]+=d; out[j+2]+=d;
+    }
+  }
+}
 function applyFilter(src, w, h, mode){
   const out = new Uint8ClampedArray(src);
-  if (mode==='orig') return out;
+  if (mode==='orig'){ sharpen(out,w,h,0.6); return out; }
   const n=w*h, g=toGray(src,n), {bl,sw,sh,s}=paperBackground(g,w,h);
-  const lo=28, hi=245, k=255/(hi-lo);
+  // Curva: papel -> blanco, tinta más oscura y con más contraste
+  const lo=18, hi=232, gamma=1.55, LUT=new Uint8ClampedArray(2400);
+  for (let v=0; v<2400; v++){ const t=Math.min(1,Math.max(0,(v-lo)/(hi-lo))); LUT[v]=Math.round(255*Math.pow(t,gamma)); }
   const norm = new Uint8ClampedArray(n);
   const factor = new Float32Array(n);
   for (let y=0;y<h;y++){
@@ -433,18 +457,26 @@ function applyFilter(src, w, h, mode){
       let fx=(x+0.5)/s-0.5; if (fx<0) fx=0; if (fx>sw-1) fx=sw-1; const x0=fx|0, x1=Math.min(sw-1,x0+1), ax=fx-x0;
       const t=bl[y0*sw+x0]+(bl[y0*sw+x1]-bl[y0*sw+x0])*ax, b=bl[y1*sw+x0]+(bl[y1*sw+x1]-bl[y1*sw+x0])*ax;
       const bg=Math.max(30, t+(b-t)*ay), i=y*w+x;
-      factor[i]=255/bg; norm[i]=(g[i]*factor[i]-lo)*k;
+      factor[i]=255/bg; norm[i]=g[i]*factor[i];
     }
   }
   if (mode==='enhance'){
+    // Balance de blancos: el color medio del papel pasa a ser gris neutro
+    let sr=0,sg=0,sb=0,cnt=0;
+    for (let i=0,j=0;i<n;i+=7,j+=28) if (norm[i]>=225){ sr+=src[j]; sg+=src[j+1]; sb+=src[j+2]; cnt++; }
+    let gR=1,gG=1,gB=1;
+    if (cnt>50){ const m=(sr+sg+sb)/3; gR=m/sr; gG=m/sg; gB=m/sb; }
+    const gains=[gR,gG,gB];
     for (let i=0,j=0;i<n;i++,j+=4){
       const f=factor[i];
-      for (let c=0;c<3;c++) out[j+c]=(src[j+c]*f-lo)*k;
+      for (let c=0;c<3;c++) out[j+c]=LUT[Math.min(2399,(src[j+c]*f*gains[c])|0)];
     }
+    sharpen(out,w,h,0.9);
   } else if (mode==='gray'){
-    for (let i=0,j=0;i<n;i++,j+=4){ const v=norm[i]; out[j]=out[j+1]=out[j+2]=v; }
+    for (let i=0,j=0;i<n;i++,j+=4){ const v=LUT[norm[i]]; out[j]=out[j+1]=out[j+2]=v; }
+    sharpen(out,w,h,0.9);
   } else if (mode==='bw'){
-    const t = Math.min(200, Math.max(110, otsu(norm)+10));
+    const t = Math.min(215, Math.max(120, otsu(norm)+12));
     for (let i=0,j=0;i<n;i++,j+=4){ const v=norm[i]<t?0:255; out[j]=out[j+1]=out[j+2]=v; }
   }
   return out;
@@ -453,6 +485,8 @@ function applyFilter(src, w, h, mode){
 
 // ================= App =================
 const $ = s => document.querySelector(s);
+const MAX_SRC = 4600;   // lado largo máximo de la foto de origen
+const PPI = 300;
 const S = {
   stream:null, detTimer:null, liveQuad:null, quadHist:[], stableSince:0, auto:true, capturing:false,
   src:null, quad:null, ratio:'auto', warped:null, filter:'enhance', rot:0, filtered:{}, pages:[], editIdx:-1,
@@ -515,6 +549,7 @@ async function startCamera(){
     if (!window.isSecureContext) throw {name:'Insecure'};
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw {name:'NoGum'};
     const tries = [
+      {audio:false, video:{facingMode:{ideal:'environment'}, width:{ideal:3840}, height:{ideal:2160}}},
       {audio:false, video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}}},
       {audio:false, video:{facingMode:{ideal:'environment'}}},
       {audio:false, video:true}
@@ -526,6 +561,7 @@ async function startCamera(){
     }
     if (!stream) throw err || {name:'Unknown'};
     S.stream = stream;
+    try { await stream.getVideoTracks()[0].applyConstraints({advanced:[{focusMode:'continuous'}]}); } catch(e){}
     const v=$('#video'); v.srcObject=stream; await v.play().catch(()=>{});
     show('sCam'); updateDocThumbs(); startLive();
   } catch(e){
@@ -610,10 +646,38 @@ async function capture(){
   const v=$('#video'); if (!v.videoWidth){ S.capturing=false; return; }
   const f=$('#flash'); f.style.transition='none'; f.style.opacity=.85; requestAnimationFrame(()=>{ f.style.transition='opacity .35s'; f.style.opacity=0; });
   if (navigator.vibrate) try{ navigator.vibrate(40); }catch(e){}
-  const c=canvasOf(v.videoWidth, v.videoHeight); c.getContext('2d').drawImage(v,0,0);
-  const q = S.liveQuad ? S.liveQuad.map(p=>({...p})) : null;
-  stopCamera();
+  let q = S.liveQuad ? S.liveQuad.map(p=>({...p})) : null;
+  busy(true,'Capturando en alta resolución…');
+  let c = await takeFullPhoto(v);
+  if (c){
+    // La foto completa puede tener otro tamaño: escalar la detección o repetirla
+    const sx=c.width/v.videoWidth, sy=c.height/v.videoHeight;
+    if (q && Math.abs(sx/sy-1)<0.02) q=q.map(p=>({x:p.x*sx, y:p.y*sy})); else q=null;
+  } else {
+    c=canvasOf(v.videoWidth, v.videoHeight); c.getContext('2d').drawImage(v,0,0);
+  }
+  stopCamera(); busy(false);
   setSource(c, q);
+}
+// Foto a resolución completa del sensor (Chrome Android). En otros navegadores: null
+async function takeFullPhoto(v){
+  try {
+    const track = S.stream && S.stream.getVideoTracks()[0];
+    if (!track || typeof ImageCapture==='undefined') return null;
+    const ic = new ImageCapture(track);
+    let opts = {};
+    try { const caps = await ic.getPhotoCapabilities();
+      if (caps && caps.imageWidth && caps.imageWidth.max) opts = {imageWidth:caps.imageWidth.max, imageHeight:caps.imageHeight.max};
+    } catch(e){}
+    const blob = await Promise.race([ic.takePhoto(opts), new Promise((_,r)=>setTimeout(()=>r('timeout'),6000))]);
+    const bmp = await createImageBitmap(blob, {imageOrientation:'from-image'});
+    // Debe tener la misma orientación que el vídeo
+    if ((bmp.width>bmp.height) !== (v.videoWidth>v.videoHeight)) return null;
+    if (Math.max(bmp.width,bmp.height) <= Math.max(v.videoWidth,v.videoHeight)) return null;
+    const sc=Math.min(1, MAX_SRC/Math.max(bmp.width,bmp.height));
+    const c=canvasOf(Math.round(bmp.width*sc), Math.round(bmp.height*sc)); c.getContext('2d').drawImage(bmp,0,0,c.width,c.height);
+    return c;
+  } catch(e){ return null; }
 }
 
 // ---------- Cargar imagen ----------
@@ -625,7 +689,7 @@ async function loadFile(file){
     try { bmp = await createImageBitmap(file, {imageOrientation:'from-image'}); }
     catch(e){ bmp = await new Promise((res,rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=URL.createObjectURL(file); }); }
     const w0=bmp.width||bmp.naturalWidth, h0=bmp.height||bmp.naturalHeight;
-    const sc=Math.min(1, 3200/Math.max(w0,h0)), w=Math.round(w0*sc), h=Math.round(h0*sc);
+    const sc=Math.min(1, MAX_SRC/Math.max(w0,h0)), w=Math.round(w0*sc), h=Math.round(h0*sc);
     const c=canvasOf(w,h); c.getContext('2d').drawImage(bmp,0,0,w,h);
     stopCamera();
     setSource(c, null);
@@ -705,8 +769,12 @@ async function doCrop(){
     const src=S.src;
     if (!S.srcData) S.srcData = src.getContext('2d').getImageData(0,0,src.width,src.height).data;
     const q = orderQuad(S.quad);
-    const {W,H} = outputSize(q, S.ratio, 2480, src.width/2, src.height/2);
+    // 300 ppi: lado largo de 297 mm (A4) u 11" (Carta)
+    const longSide = Math.round((S.ratio==='letter' ? 11 : 297/25.4) * PPI);
+    const {W,H} = outputSize(q, S.ratio, longSide, src.width/2, src.height/2);
     S.warped = {w:W, h:H, data:warpData(S.srcData, src.width, src.height, q, W, H)};
+    const srcLong = Math.max(dist(q[0],q[3]), dist(q[1],q[2]), dist(q[0],q[1]), dist(q[3],q[2]));
+    S.realPpi = Math.round(PPI * srcLong / Math.max(W,H));
     S.filtered={}; S.rot=0;
     await renderResult();
     show('sResult');
@@ -724,15 +792,22 @@ function finalCanvas(){
 }
 async function renderResult(){
   const c=finalCanvas(); S.resultCanvas=c;
-  const url = c.toDataURL('image/jpeg', 0.9);
-  $('#resImg').src = url;
+  const s=Math.min(1,1600/Math.max(c.width,c.height)), pv=canvasOf(Math.round(c.width*s),Math.round(c.height*s));
+  pv.getContext('2d').drawImage(c,0,0,pv.width,pv.height);
+  $('#resImg').src = pv.toDataURL('image/jpeg', 0.9);
+  const rp=S.realPpi||0;
+  $('#resInfo').innerHTML = `${c.width}×${c.height} px · ${PPI} ppi · detalle de la foto ≈ ${rp} ppi`
+    + (rp<200 ? ' <b style="color:var(--warn)">— acerca más el móvil a la hoja</b>' : '');
 }
 
 // ---------- Páginas / documento ----------
 function thumbOf(c){ const s=Math.min(1,360/Math.max(c.width,c.height)); const t=canvasOf(Math.round(c.width*s),Math.round(c.height*s)); t.getContext('2d').drawImage(c,0,0,t.width,t.height); return t.toDataURL('image/jpeg',0.8); }
-function keepPage(){
+async function keepPage(){
   const c=S.resultCanvas;
-  S.pages.push({canvas:c, thumb:thumbOf(c), w:c.width, h:c.height});
+  busy(true,'Guardando página…'); await nextFrame();
+  const blob = await canvasBlob(c, 0.92);   // se guarda como JPEG para no agotar la memoria
+  busy(false);
+  S.pages.push({blob, thumb:thumbOf(c), w:c.width, h:c.height});
   renderPages(); show('sPages'); toast(`Página ${S.pages.length} guardada`);
 }
 function renderPages(){
@@ -771,27 +846,37 @@ async function saveBlob(name, blob){
   setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 5000);
 }
 function canvasBlob(c, q=0.9){ return new Promise(r=>c.toBlob(r,'image/jpeg',q)); }
-async function savePageJpg(i){ const b=await canvasBlob(S.pages[i].canvas, 0.92); saveBlob(`escaneo_${stamp()}_p${i+1}.jpg`, b); }
-function loadJsPDF(){
-  if (window.jspdf) return Promise.resolve(window.jspdf);
-  return new Promise((res,rej)=>{ const s=document.createElement('script');
-    s.src='https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
-    s.onload=()=>res(window.jspdf); s.onerror=rej; document.head.appendChild(s); });
+async function savePageJpg(i){ saveBlob(`escaneo_${stamp()}_p${i+1}.jpg`, S.pages[i].blob); }
+// PDF mínimo propio: incrusta los JPEG tal cual (DCTDecode), sin librerías ni recompresión
+async function buildPdf(pages){
+  const enc=new TextEncoder(), parts=[], offsets=[]; let len=0;
+  const put = x => { const u = typeof x==='string' ? enc.encode(x) : x; parts.push(u); len+=u.length; };
+  const obj = (id, body) => { offsets[id]=len; put(`${id} 0 obj\n`); body(); put(`\nendobj\n`); };
+  const n=pages.length, kids=[];
+  for (let i=0;i<n;i++) kids.push(`${3+i*3} 0 R`);
+  put('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
+  obj(1, ()=>put('<< /Type /Catalog /Pages 2 0 R >>'));
+  obj(2, ()=>put(`<< /Type /Pages /Count ${n} /Kids [${kids.join(' ')}] >>`));
+  for (let i=0;i<n;i++){
+    const p=pages[i], pid=3+i*3, cid=pid+1, iid=pid+2;
+    const wpt=(p.w/PPI*72).toFixed(3), hpt=(p.h/PPI*72).toFixed(3);   // 72 pt por pulgada → 300 ppi exactos
+    const jpg=new Uint8Array(await p.blob.arrayBuffer());
+    const content=`q ${wpt} 0 0 ${hpt} 0 0 cm /Im0 Do Q`;
+    obj(pid, ()=>put(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${wpt} ${hpt}] /Resources << /XObject << /Im0 ${iid} 0 R >> >> /Contents ${cid} 0 R >>`));
+    obj(cid, ()=>{ put(`<< /Length ${content.length} >>\nstream\n`); put(content); put('\nendstream'); });
+    obj(iid, ()=>{ put(`<< /Type /XObject /Subtype /Image /Width ${p.w} /Height ${p.h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.length} >>\nstream\n`); put(jpg); put('\nendstream'); });
+  }
+  const total=3+n*3, xref=len;
+  let x=`xref\n0 ${total}\n0000000000 65535 f \n`;
+  for (let i=1;i<total;i++) x+=String(offsets[i]).padStart(10,'0')+' 00000 n \n';
+  put(x); put(`trailer\n<< /Size ${total} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  return new Blob(parts, {type:'application/pdf'});
 }
 async function exportPdf(){
   if (!S.pages.length){ toast('Añade al menos una página'); return; }
   busy(true,'Creando PDF…'); await nextFrame();
   try {
-    const {jsPDF} = await loadJsPDF();
-    let pdf=null;
-    for (const p of S.pages){
-      const wmm = p.w>p.h ? 297 : 210, hmm = wmm*p.h/p.w, o = p.w>p.h ? 'l':'p';
-      if (!pdf) pdf = new jsPDF({unit:'mm', format:[wmm,hmm], orientation:o, compress:true});
-      else pdf.addPage([wmm,hmm], o);
-      const url = p.canvas.toDataURL('image/jpeg', 0.85);
-      pdf.addImage(url, 'JPEG', 0, 0, wmm, hmm, undefined, 'FAST');
-    }
-    const blob = pdf.output('blob');
+    const blob = await buildPdf(S.pages);
     busy(false);
     await saveBlob(`escaneo_${stamp()}.pdf`, blob);
   } catch(e){ busy(false); console.error(e); toast('No se pudo crear el PDF'); }
