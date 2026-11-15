@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#0d0f12">
+<meta name="description" content="Escáner de documentos con nivel, corrección de perspectiva y PDF a 300 ppi">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="DocScan">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <title>Escáner de documentos</title>
 <style>
 :root{
@@ -102,6 +110,20 @@ header.bar button{padding:6px 8px;color:var(--acc);font-weight:600}
 .pg .meta button.del{color:var(--bad)}
 #emptyPages{color:var(--mut);text-align:center;padding:40px 10px;grid-column:1/-1}
 
+.chk{display:flex;gap:10px;align-items:flex-start;font-size:14px;font-weight:600}
+.chk input{width:20px;height:20px;margin:1px 0 0;accent-color:var(--acc);flex:none}
+.chk small{display:block;font-weight:400;color:var(--mut);font-size:12px;margin-top:2px}
+.sheet{position:fixed;inset:0;background:#000b;display:none;z-index:15;align-items:flex-end}
+.sheet.on{display:flex}
+.sheet .panel{width:100%;background:var(--panel);border-radius:18px 18px 0 0;padding:16px 14px calc(16px + env(safe-area-inset-bottom));display:flex;flex-direction:column;gap:10px}
+.sheet h3{margin:2px 4px 4px;font-size:17px}
+.opt{text-align:left;background:var(--bg);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:4px}
+.opt b{font-size:15px}
+.opt span{font-size:13px;color:var(--mut)}
+.opt:active{border-color:var(--acc)}
+#ocrBox{position:fixed;inset:0;background:#000c;display:none;z-index:15;align-items:flex-end}
+#ocrBox .panel{width:100%;height:85%;background:var(--panel);border-radius:18px 18px 0 0;display:flex;flex-direction:column;overflow:hidden}
+#ocrText{flex:1;margin:12px;background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:12px;font:14px/1.5 ui-monospace,Menlo,monospace;resize:none}
 #busy{position:fixed;inset:0;background:#000b;display:none;align-items:center;justify-content:center;flex-direction:column;gap:14px;z-index:20}
 #busy.on{display:flex}
 .spin{width:42px;height:42px;border-radius:50%;border:4px solid #ffffff33;border-top-color:var(--acc);animation:sp 0.8s linear infinite}
@@ -137,6 +159,7 @@ header.bar button{padding:6px 8px;color:var(--acc);font-weight:600}
       Elegir imagen de la galería
     </button>
     <button class="btn" id="btnDoc" style="display:none"></button>
+    <button class="btn" id="btnInstall" style="display:none">⬇ Instalar app</button>
   </div>
   <div id="camNote"></div>
 </section>
@@ -221,13 +244,25 @@ header.bar button{padding:6px 8px;color:var(--acc);font-weight:600}
   </header>
   <div id="pagesGrid"></div>
   <div class="foot">
-    <button class="btn" id="pagesAdd">+ Añadir página</button>
+    <div class="row">
+      <button class="btn" id="pagesAdd">+ Página</button>
+      <button class="btn" id="pagesText">Copiar texto</button>
+    </div>
     <button class="btn primary" id="pagesPdf">Exportar PDF</button>
   </div>
 </section>
 
 <input type="file" id="fileCap" accept="image/*" capture="environment" hidden>
 <input type="file" id="filePick" accept="image/*" hidden>
+<div id="pdfSheet" class="sheet"><div class="panel">
+  <h3>Exportar PDF</h3>
+  <button class="opt" id="pdfFast"><b>PDF normal</b><span>Inmediato. Solo imágenes.</span></button>
+  <button class="opt" id="pdfOcr"><b>PDF con texto reconocido</b><span>Se puede buscar y copiar texto. Tarda unos segundos por página y la primera vez necesita conexión. Funciona mejor con texto impreso que con letra a mano.</span></button>
+  <button class="btn" id="pdfCancel">Cancelar</button>
+</div></div>
+<div id="ocrBox"><div class="panel"><header class="bar"><h2>Texto reconocido</h2><button id="ocrClose">Cerrar</button></header>
+  <textarea id="ocrText" spellcheck="false"></textarea>
+  <div class="foot"><button class="btn primary" id="ocrCopy">Copiar</button></div></div></div>
 <div id="busy"><div class="spin"></div><div id="busyTxt">Procesando…</div></div>
 <div id="toast"></div>
 
@@ -847,39 +882,122 @@ async function saveBlob(name, blob){
 }
 function canvasBlob(c, q=0.9){ return new Promise(r=>c.toBlob(r,'image/jpeg',q)); }
 async function savePageJpg(i){ saveBlob(`escaneo_${stamp()}_p${i+1}.jpg`, S.pages[i].blob); }
-// PDF mínimo propio: incrusta los JPEG tal cual (DCTDecode), sin librerías ni recompresión
+// ---------- Reconocimiento de texto (OCR con Tesseract.js) ----------
+const TESS_URL='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+let ocrWorkerP=null, ocrProgress=()=>{};
+function loadTesseract(){
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  return new Promise((res,rej)=>{ const sc=document.createElement('script'); sc.src=TESS_URL;
+    sc.onload=()=>window.Tesseract?res(window.Tesseract):rej(new Error('no Tesseract')); sc.onerror=()=>rej(new Error('load')); document.head.appendChild(sc); });
+}
+function getOcrWorker(){
+  if (!ocrWorkerP) ocrWorkerP = loadTesseract().then(T=>T.createWorker('spa', 1, {
+    logger: m=>{ if (m && typeof m.progress==='number') ocrProgress(m.status, m.progress); }
+  })).catch(e=>{ ocrWorkerP=null; throw e; });
+  return ocrWorkerP;
+}
+function collectWords(data){
+  let words = data.words;
+  if (!words || !words.length){
+    words=[]; (data.blocks||[]).forEach(b=>(b.paragraphs||[]).forEach(pa=>(pa.lines||[]).forEach(l=>(l.words||[]).forEach(w=>words.push(w)))));
+  }
+  return words.filter(w=>w && w.text && w.text.trim() && w.bbox)
+              .map(w=>({t:w.text.trim(), x0:w.bbox.x0, y0:w.bbox.y0, x1:w.bbox.x1, y1:w.bbox.y1, c:w.confidence}));
+}
+// Reconoce las páginas que aún no tienen texto. Devuelve false si el OCR no está disponible.
+async function ocrPages(pages){
+  const todo = pages.filter(p=>!p.ocr);
+  if (!todo.length) return true;
+  let worker;
+  busy(true,'Cargando reconocimiento de texto…'); await nextFrame();
+  try { worker = await getOcrWorker(); }
+  catch(e){ toast('No se pudo cargar el reconocimiento de texto (¿sin conexión?)', 3500); return false; }
+  for (let k=0;k<todo.length;k++){
+    const p=todo[k], idx=pages.indexOf(p)+1;
+    ocrProgress = (st, pr) => { if (st==='recognizing text') $('#busyTxt').textContent = `Reconociendo texto · página ${idx} de ${pages.length} · ${Math.round(pr*100)} %`; };
+    $('#busyTxt').textContent = `Reconociendo texto · página ${idx} de ${pages.length}…`;
+    try {
+      const {data} = await worker.recognize(p.blob);
+      p.ocr = {words: collectWords(data), text: (data.text||'').trim()};
+    } catch(e){ console.error(e); p.ocr = {words:[], text:''}; }
+  }
+  ocrProgress=()=>{};
+  return true;
+}
+
+// PDF mínimo propio: incrusta los JPEG tal cual (DCTDecode) y, si hay OCR, una capa de texto invisible
+const WINANSI = {'€':0x80,'‚':0x82,'„':0x84,'…':0x85,'‘':0x91,'’':0x92,'“':0x93,'”':0x94,'•':0x95,'–':0x96,'—':0x97};
+function pdfHex(str){
+  let h='';
+  for (const ch of str){
+    let c = ch.charCodeAt(0);
+    if (ch.length>1 || c>255) c = WINANSI[ch] || 0x3F; else if (c<32 || (c>126 && c<160)) c = WINANSI[ch] || 0x3F;
+    h += c.toString(16).padStart(2,'0');
+  }
+  return '<'+h+'>';
+}
+function textLayer(p, hptNum){
+  if (!p.ocr || !p.ocr.words.length) return '';
+  const k=72/PPI; let t='BT 3 Tr\n';
+  for (const w of p.ocr.words){
+    const hpx=Math.max(4,w.y1-w.y0), fs=hpx*k*0.95, wpt=Math.max(1,(w.x1-w.x0)*k);
+    const x=w.x0*k, y=hptNum-(w.y1-hpx*0.18)*k;
+    const tz=Math.max(10,Math.min(500, 100*wpt/(fs*0.55*Math.max(1,[...w.t].length))));
+    t += `/F1 ${fs.toFixed(2)} Tf ${tz.toFixed(1)} Tz 1 0 0 1 ${x.toFixed(2)} ${y.toFixed(2)} Tm ${pdfHex(w.t+' ')} Tj\n`;
+  }
+  return t+'ET';
+}
 async function buildPdf(pages){
   const enc=new TextEncoder(), parts=[], offsets=[]; let len=0;
   const put = x => { const u = typeof x==='string' ? enc.encode(x) : x; parts.push(u); len+=u.length; };
   const obj = (id, body) => { offsets[id]=len; put(`${id} 0 obj\n`); body(); put(`\nendobj\n`); };
-  const n=pages.length, kids=[];
+  const n=pages.length, kids=[], fid=3+n*3;
   for (let i=0;i<n;i++) kids.push(`${3+i*3} 0 R`);
   put('%PDF-1.4\n%\xE2\xE3\xCF\xD3\n');
   obj(1, ()=>put('<< /Type /Catalog /Pages 2 0 R >>'));
   obj(2, ()=>put(`<< /Type /Pages /Count ${n} /Kids [${kids.join(' ')}] >>`));
   for (let i=0;i<n;i++){
     const p=pages[i], pid=3+i*3, cid=pid+1, iid=pid+2;
-    const wpt=(p.w/PPI*72).toFixed(3), hpt=(p.h/PPI*72).toFixed(3);   // 72 pt por pulgada → 300 ppi exactos
+    const hptNum=p.h/PPI*72, wpt=(p.w/PPI*72).toFixed(3), hpt=hptNum.toFixed(3);   // 72 pt por pulgada → 300 ppi exactos
     const jpg=new Uint8Array(await p.blob.arrayBuffer());
-    const content=`q ${wpt} 0 0 ${hpt} 0 0 cm /Im0 Do Q`;
-    obj(pid, ()=>put(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${wpt} ${hpt}] /Resources << /XObject << /Im0 ${iid} 0 R >> >> /Contents ${cid} 0 R >>`));
+    const content=`q ${wpt} 0 0 ${hpt} 0 0 cm /Im0 Do Q\n` + textLayer(p, hptNum);   // solo ASCII: longitud = bytes
+    obj(pid, ()=>put(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${wpt} ${hpt}] /Resources << /XObject << /Im0 ${iid} 0 R >> /Font << /F1 ${fid} 0 R >> >> /Contents ${cid} 0 R >>`));
     obj(cid, ()=>{ put(`<< /Length ${content.length} >>\nstream\n`); put(content); put('\nendstream'); });
     obj(iid, ()=>{ put(`<< /Type /XObject /Subtype /Image /Width ${p.w} /Height ${p.h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.length} >>\nstream\n`); put(jpg); put('\nendstream'); });
   }
-  const total=3+n*3, xref=len;
+  obj(fid, ()=>put('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>'));
+  const total=fid+1, xref=len;
   let x=`xref\n0 ${total}\n0000000000 65535 f \n`;
   for (let i=1;i<total;i++) x+=String(offsets[i]).padStart(10,'0')+' 00000 n \n';
   put(x); put(`trailer\n<< /Size ${total} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
   return new Blob(parts, {type:'application/pdf'});
 }
-async function exportPdf(){
+function exportPdf(){
   if (!S.pages.length){ toast('Añade al menos una página'); return; }
+  const done = S.pages.every(p=>p.ocr);
+  $('#pdfOcr').querySelector('span').textContent = done
+    ? 'El texto ya está reconocido: se crea al momento.'
+    : 'Se puede buscar y copiar texto. Tarda unos segundos por página y la primera vez necesita conexión. Funciona mejor con texto impreso que con letra a mano.';
+  $('#pdfSheet').classList.add('on');
+}
+async function doExportPdf(ocr){
+  $('#pdfSheet').classList.remove('on');
+  let withText=false;
+  if (ocr) withText = await ocrPages(S.pages);
   busy(true,'Creando PDF…'); await nextFrame();
   try {
-    const blob = await buildPdf(S.pages);
+    const blob = await buildPdf(withText ? S.pages : S.pages.map(p=>({...p, ocr:null})));
     busy(false);
     await saveBlob(`escaneo_${stamp()}.pdf`, blob);
   } catch(e){ busy(false); console.error(e); toast('No se pudo crear el PDF'); }
+}
+async function copyText(){
+  if (!S.pages.length){ toast('Añade al menos una página'); return; }
+  const ok = await ocrPages(S.pages); busy(false);
+  if (!ok) return;
+  const txt = S.pages.map((p,i)=>`— Página ${i+1} —\n${p.ocr.text}`).join('\n\n').trim();
+  $('#ocrText').value = txt; $('#ocrBox').style.display='flex';
+  try { await navigator.clipboard.writeText(txt); toast('Texto copiado'); } catch(e){ toast('Selecciona el texto y cópialo'); }
 }
 
 // ---------- Eventos ----------
@@ -909,12 +1027,34 @@ $('#resRetake').onclick = newScan;
 $('#resKeep').onclick = keepPage;
 $('#pagesAdd').onclick = newScan;
 $('#pagesPdf').onclick = exportPdf;
+$('#pagesText').onclick = copyText;
+$('#ocrClose').onclick = ()=>{ $('#ocrBox').style.display='none'; };
+$('#ocrCopy').onclick = async()=>{ const t=$('#ocrText'); try { await navigator.clipboard.writeText(t.value); toast('Texto copiado'); } catch(e){ t.select(); toast('Selecciona y copia'); } };
+$('#pdfFast').onclick = ()=>doExportPdf(false);
+$('#pdfOcr').onclick = ()=>doExportPdf(true);
+$('#pdfCancel').onclick = ()=>$('#pdfSheet').classList.remove('on');
+$('#pdfSheet').onclick = e=>{ if (e.target.id==='pdfSheet') $('#pdfSheet').classList.remove('on'); };
 $('#pagesHome').onclick = ()=>{ show('sStart'); updateDocThumbs(); };
 $('#pagesClear').onclick = ()=>{ if (!S.pages.length) return;
   if ($('#pagesClear').dataset.c){ S.pages=[]; renderPages(); delete $('#pagesClear').dataset.c; $('#pagesClear').textContent='Vaciar'; }
   else { $('#pagesClear').dataset.c=1; $('#pagesClear').textContent='¿Seguro?'; setTimeout(()=>{ delete $('#pagesClear').dataset.c; $('#pagesClear').textContent='Vaciar'; },2500); } };
 function newScan(){ if (S.camWorked===false) { show('sStart'); return; } startCamera().then(()=>{ if (!S.stream) show('sStart'); }); }
 updateDocThumbs();
+
+// ---------- App instalable (PWA) ----------
+(function(){
+  let inFrame=false; try { inFrame = window.top !== window.self; } catch(e){ inFrame=true; }
+  if (!inFrame && 'serviceWorker' in navigator && (location.protocol==='https:' || location.hostname==='localhost'))
+    window.addEventListener('load', ()=>navigator.serviceWorker.register('sw.js').catch(()=>{}));
+  // Botón «Instalar app» cuando el navegador lo permite (Chrome/Android)
+  let deferred=null;
+  window.addEventListener('beforeinstallprompt', e=>{
+    e.preventDefault(); deferred=e;
+    const b=$('#btnInstall'); b.style.display='flex';
+    b.onclick=async()=>{ b.style.display='none'; deferred.prompt(); try{ await deferred.userChoice; }catch(_){} deferred=null; };
+  });
+  window.addEventListener('appinstalled', ()=>{ $('#btnInstall').style.display='none'; toast('App instalada'); });
+})();
 </script>
 </body>
 </html>
